@@ -240,4 +240,197 @@ resolve(roster: Beach[], readings: SourceReading[], ok: Set<Source>, today: Date
 
 Because "no reading" means *open* for a provincial beach, the resolver has to know which sources actually answered. A source that throws is absent from `readings` and from `ok`; the resolver then **omits** every beach that source is authoritative for (HRM beaches need `hrm`; provincial beaches need both `parks` and `algae`) instead of guessing. `refresh.ts` upserts only the rows that came back, so an omitted beach keeps its `last_confirmed_at` — the PRD's degradation rule, with no scraper aware it exists.
 
+#### The server seeds the client once; selection is local state that the URL follows shallowly
+
+One server component reads the search params and Supabase, then hands everything to one client component. Below that line nothing fetches: the map, the sheet, and the detail are all controlled by a single `selectedId`.
+
+```tsx
+<Page>  (app/page.tsx, server)              reads ?day ?beach, queries Supabase once
+  <BeachApp beaches status health replayDay initialBeachId>   (client)
+    useState(selectedId ← initialBeachId)   on change: history.replaceState('?beach=…')  — no navigation
+    useGeolocation()                         sorts the sheet; falls back to Halifax
+    <BeachMap>                               pins as markers; flyTo whenever selectedId changes
+    <SearchBox>                              onPick → setSelectedId
+    <NearbySheet>                            bottom sheet <lg, side panel ≥lg — one component
+      <BeachRow ×n>                          onTap → setSelectedId
+      <BeachDetail>                          shown when selectedId; reports + 14-day strip
+        <ReportSignForm>                     → server action
+    <ReplayControl>                          router.push('/?day=…')  — a real navigation
+    <ReplayBanner> <FreshnessFooter>
+```
+
+The rule that decides which mechanism a control uses: **if the data changes, navigate; if only the camera changes, set state.** Picking a beach only moves the camera and opens a sheet, so it is a `useState` write plus `history.replaceState` — the fly-to starts on the frame you tap, and the address bar is already what *Share* should copy. Picking a replay day changes which rows the page needs, so it is a real `router.push` and the server renders again from `status_day`.
+
+#### The map is `react-map-gl/maplibre`, and a pin is an ordinary React component in a `<Marker>`
+
+MapLibre needs `window`, so `BeachMap` is loaded with `dynamic(..., { ssr: false })`. Inside it the wrapper owns the map lifecycle; the component owns nothing but props and one effect.
+
+```tsx
+// components/beach-map.tsx  ('use client')
+<Map ref={mapRef} mapStyle={SATELLITE_TERRAIN_STYLE}
+     projection="globe" terrain={{ source: 'dem', exaggeration: 1.6 }}>
+  {beaches.map(b => (
+    <Marker key={b.id} longitude={b.lon} latitude={b.lat} onClick={() => onSelect(b.id)}>
+      <StatusPin state={status[b.id].state}
+                 hollow={b.authority === 'province'}
+                 flagged={flags[b.id]} />
+    </Marker>
+  ))}
+</Map>
+
+useEffect(() => {                                   // fly-to on every selection
+  if (selectedId) mapRef.current?.flyTo({ center: coords(selectedId), zoom: 13.5, pitch: 65 })
+}, [selectedId])
+```
+
+A `<Marker>` is a DOM element MapLibre screen-anchors, so a pin is upright at 65° pitch by construction — the PRD's "legible at any tilt" without any `pitch-alignment` work. It also means the pin's three states, the hollow provincial ring, the ⚑ report badge, and its tap target are Tailwind and JSX rather than sprite sheets and style expressions. Thirty-five markers cost nothing; a GeoJSON `circle` layer would only pay off at hundreds of points.
+
+`SATELLITE_TERRAIN_STYLE` is a static style object lifted straight from `mockup-3d-map-live.html`: the EOX raster source, the Terrarium `raster-dem` source, a hillshade layer, and `terrain`. The globe intro is the mockup's `flyTo` sequence run once on `load`.
+
+#### Parsers are pure functions over a string, tested against captured pages
+
+Each source module exports a `fetch` that does the network and a `parse` that does not, so a test never touches halifax.ca. The HTML pages go through `cheerio`; the Atom feed goes through `fast-xml-parser`. Regex was rejected because a Drupal template tweak would turn a passing pattern into *zero readings*, which the resolver would read as "no advisories, every provincial beach open."
+
+```ts
+// lib/ingest/sources/hrm.ts
+export async function fetchHrm(): Promise<string>        // GET with a browser UA; throws on non-200
+export function parseHrm(html: string): SourceReading[]  // pure
+  $('table[data-title="Supervised beach status updates"] tbody tr')
+    → { name: td[0], verbatim: td[5], kind: HRM_WORDS[td[5]] }   // 4 words → 4 kinds; anything else: log, skip
+
+// lib/ingest/sources/algae.ts
+export function parseAlgae(xml: string): SourceReading[]
+  feed.entry[] → content.notice.{lake, date, county} → match each lake against roster lakes[]
+```
+
+```text
+lib/ingest/__fixtures__/
+  hrm-2026-09-12.html      # captured with curl -A "Mozilla/5.0 …": all 18 rows "Supervision ended"
+  hrm-2026-08-14.html      # the same page with two cells hand-edited to "Risk Advisory in Effect"
+  parks-2026-09-12.html
+  algae-2026-09-12.atom
+```
+
+Tests run under `vitest`. Three functions are worth testing and the rest is glue: `parseHrm`, `parseParks` / `parseAlgae`, and `resolve`. The hand-edited in-season HRM fixture is the important one — no live in-season page exists to capture until July, and that file is the only thing that exercises the advisory path, the four-word map, and the resolver's amber output before the season does it for real.
+
+#### One `loadPage()` feeds the page; the corroboration rule is a SQL view
+
+`lib/db/queries.ts` is the only module that imports the Supabase client for reads. It returns one `PageData` and `page.tsx` is three lines: read params, await it, render `<BeachApp {...data} />`.
+
+```ts
+export async function loadPage({ day, beachId }: { day?: string; beachId?: string }): Promise<PageData>
+
+type PageData = {
+  beaches:    Beach[]
+  status:     Record<BeachId, BeachStatusRow>   // beach_status, or status_day rows when day is set
+  health:     SourceHealthRow[]                 // 3 rows → freshness footer
+  flags:      Record<BeachId, ReportFlag>       // from report_flags; empty when day is set
+  strip?:     StatusDayRow[]                    // last 14 days for beachId, when set
+  replayDay?: string
+}
+```
+
+```sql
+create view report_flags as
+  select beach_id, sign, count(distinct ip_hash) as people, max(created_at) as last_at
+  from reports
+  where created_at >= date_trunc('day', now() at time zone 'America/Halifax')
+  group by beach_id, sign
+  having count(distinct ip_hash) >= 2;
+```
+
+The `having` clause is the rule with safety weight, and it lives in the migration where neither the page nor the server action can loosen it by accident. Flags are empty whenever `day` is set, so a replayed August map never carries today's reports. Row types come from `supabase gen types`; nothing hand-copies a table shape.
+
+#### The rest of the server side is three small entry points
+
+```ts
+// app/api/refresh/route.ts
+export const maxDuration = 60
+export async function GET(req: Request) {
+  if (req.headers.get('authorization') !== `Bearer ${process.env.CRON_SECRET}`) return new Response(null, { status: 401 })
+  return Response.json(await refresh())            // returns the three source_health rows
+}
+
+// app/actions/report.ts   ('use server')
+export async function submitReport(form: FormData): Promise<{ ok: true } | { ok: false; reason: 'bot' | 'throttled' | 'invalid' }>
+  // turnstile → ip hash → throttle count → optional photo upload → insert   (lib/db/reports.ts)
+
+// lib/ingest/refresh.ts
+export async function refresh(): Promise<SourceHealthRow[]>
+  // today = new Date() in America/Halifax; every step from the System Design pseudocode
+```
+
+"Today" is always the Halifax calendar date, computed once in `refresh()` and passed down, so a run at 02:00 UTC writes the right `status_day` row.
+
+#### The project is a Next.js app at the repo root, beside the untouched Vite scaffold
+
+```diff
+ volta_hackathon/
++├── app/
++│   ├── layout.tsx, globals.css        # Tailwind v4 + the shadcn token block
++│   ├── page.tsx                       # server: params → loadPage → <BeachApp>
++│   ├── actions/report.ts              # server action
++│   └── api/refresh/route.ts           # cron target
++├── components/
++│   ├── beach-app.tsx                  # client root: selectedId, geolocation, layout switch
++│   ├── beach-map.tsx                  # react-map-gl/maplibre, dynamic ssr:false
++│   ├── status-pin.tsx                 # cva variants: state × hollow × flagged
++│   ├── nearby-sheet.tsx, beach-detail.tsx, search-box.tsx, report-sign-form.tsx
++│   ├── replay-control.tsx, replay-banner.tsx, freshness-footer.tsx, legend.tsx
++│   └── ui/                            # shadcn new-york/neutral: sheet, button, badge, dialog, input
++├── lib/
++│   ├── db/  client.ts, queries.ts, reports.ts, types.ts (generated)
++│   ├── ingest/  sources/{hrm,parks,algae}.ts, resolve.ts, refresh.ts, __fixtures__/
++│   ├── seed/  beaches.ts, days/2026-08-14.ts
++│   ├── map-style.ts                   # SATELLITE_TERRAIN_STYLE from the mockup
++│   └── utils.ts                       # cn()
++├── supabase/  config.toml, migrations/20260912000000_init.sql
++├── vercel.json                        # crons
++├── next.config.ts, tsconfig.json      # tsconfig excludes volta-frontend/
++├── vitest.config.ts
++├── docs/                              # research, PRD, TDD, mockups
+ ├── volta-frontend/                    # prior hackathon SPA, not built or imported
+ └── README.md
+```
+
+Environment variables, all server-only except the Turnstile site key:
+
+```text
+SUPABASE_URL                     SUPABASE_SERVICE_ROLE_KEY
+CRON_SECRET                      REPORT_IP_SALT
+TURNSTILE_SECRET_KEY             NEXT_PUBLIC_TURNSTILE_SITE_KEY
+```
+
+### What We're Not Doing
+
+- **No RLS policies and no anon key in the browser.** Every read and write goes through the server; the tables are unreachable from a public credential.
+- **No raw fetch archive, no fuzzy matching, no refresh-on-read.** Each was considered and dropped because the sources are frozen until July and the project is on Vercel Pro.
+- **No Realtime, no client-side Supabase.** An hourly source cannot feed live push.
+- **No `/beach/[slug]` route.** The app is one page; `?beach=` and `?day=` are the only URL state.
+- **No label or road layer over the satellite imagery.** Matches the mockup; search and the sheet do the finding.
+
 ### Patterns to Follow
+
+The existing `volta-frontend/` shares no domain with this app, but its shadcn setup is the same one the new project re-initialises. Three conventions carry over verbatim.
+
+**Class merging through `cn()`** (`volta-frontend/src/lib/utils.ts:1-6`) — every component that accepts `className` runs it through this, never string concatenation:
+
+```ts
+import { clsx, type ClassValue } from "clsx"
+import { twMerge } from "tailwind-merge"
+export function cn(...inputs: ClassValue[]) { return twMerge(clsx(inputs)) }
+```
+
+**Semantic colour as `cva` variants, not inline hex** (`volta-frontend/src/components/ui/badge.tsx:8-27`). The old pages broke this rule with `text-red-600` and `style={{ color: '#ef4444' }}`; `StatusPin` and the status chip should follow the primitive instead:
+
+```ts
+const badgeVariants = cva("inline-flex items-center …", {
+  variants: { variant: { default: "…", secondary: "…", destructive: "…", outline: "…" } },
+  defaultVariants: { variant: "default" },
+})
+// → statusPinVariants({ state: 'open' | 'advisory' | 'closed' | 'offseason', hollow: boolean })
+```
+
+**Tokens through `@theme inline`** (`volta-frontend/src/index.css:6-42`, `:root` at 44-77). Tailwind v4 is configured in CSS only — no `tailwind.config.*`. The four status colours are added as `--color-status-open` etc. in the same block so `bg-status-open` works everywhere, rather than re-appearing as palette classes per component.
+
+**`Sheet` sides as the layout switch** (`volta-frontend/src/components/ui/sheet.tsx:62-69`). `NearbySheet` renders the same children in `side="bottom"` below `lg` and as a fixed left column at `lg+`, the way `Layout.tsx` already used `side="left"` for its mobile nav — one component, two placements.
