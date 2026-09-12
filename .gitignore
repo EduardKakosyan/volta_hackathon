@@ -40,3 +40,5 @@ CLAUDE.md
 
 # Mac system files
 .DS_Store
+# Riptide artifacts (cloud-synced)
+.humanlayer/tasks/
